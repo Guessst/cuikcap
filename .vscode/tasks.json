@@ -1,0 +1,16 @@
+{
+    // See https://go.microsoft.com/fwlink/?LinkId=733558
+    // for the documentation about the tasks.json format
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build debug with build-windows-64-debug.bat",
+            "type": "shell",
+            "command": "${workspaceFolder}/build/scripts/build-windows-64-debug.bat",
+            "presentation": {
+                "reveal": "silent",
+                "showReuseMessage": false,
+            },
+        },
+    ]
+}

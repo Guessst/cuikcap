@@ -1,0 +1,35 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "(gdb) Build and Debug",
+            "type": "cppdbg",
+            "request": "launch",
+            "stopAtEntry": false,
+            "cwd": "${fileDirname}",
+            "program": "${workspaceFolder}\\build\\windows-debug-64\\cuikcap.exe",
+            "MIMode": "gdb",
+            "miDebuggerPath": "C:\\progs\\w64devkit-x64\\bin\\gdb.exe",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Set Disassembly Flavor to Intel",
+                    "text": "-gdb-set disassembly-flavor intel",
+                    "ignoreFailures": true
+                },
+                { "text": "set breakpoint pending on", "ignoreFailures": true },
+                { "text": "break abort", "ignoreFailures": true }
+            ],
+            "preLaunchTask": "Build debug with build-windows-64-debug.bat",
+            "avoidWindowsConsoleRedirection": true,
+            "externalConsole": true,
+        }
+    ]
+}

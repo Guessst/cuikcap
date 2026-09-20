@@ -1,0 +1,2 @@
+- Draw hovered region
+- Enable customizing keybing
