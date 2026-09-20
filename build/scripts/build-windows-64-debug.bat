@@ -18,7 +18,7 @@ if "%USE_ANALYZER%"=="1" (
     set "ANALYZER_FLAGS=%FTIME_REPORT_FLAG% -fanalyzer -fanalyzer-checker=taint -Wno-analyzer-unsafe-call-within-signal-handler"
 )
 
-gcc %PROJECT_ROOT%\main.c ^
+gcc -nostdlib -fno-builtin %PROJECT_ROOT%\main.c ^
     -std=c99 ^
     -Wall ^
     -Wextra ^

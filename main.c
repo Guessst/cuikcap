@@ -5,6 +5,28 @@ static HHOOK hMouseHook = NULL;
 static BOOL waitingForClick = FALSE;
 static BOOL blockNextUp = FALSE;
 
+static int str_contains(const char* haystack, const char* needle) {
+    const char* h;
+    const char* n;
+    
+    if (!haystack || !needle) return 0;
+    if (!*needle) return 1;
+
+    while (*haystack) {
+        h = haystack;
+        n = needle;
+        while (*h && *n && (*h == *n)) {
+            h++;
+            n++;
+        }
+        if (!*n) {
+            return 1;
+        }
+        haystack++;
+    }
+    return 0;
+}
+
 static void log_timed(const char* message) {
     SYSTEMTIME st;
     char buffer[256];
@@ -23,6 +45,51 @@ static void log_timed(const char* message) {
     if (hConsole != INVALID_HANDLE_VALUE && hConsole != NULL) {
         WriteConsoleA(hConsole, buffer, (DWORD)len, &written, NULL);
     }
+}
+
+/* 
+ * Replicates WindowFromPoint but explicitly traps upscaler overlays 
+ * which would normally be ignored due to WS_EX_TRANSPARENT 
+ */
+static HWND GetTopLevelWindowFromPoint(POINT pt) {
+    HWND hwnd = GetTopWindow(NULL);
+    while (hwnd) {
+        if (IsWindowVisible(hwnd)) {
+            RECT rect;
+            GetWindowRect(hwnd, &rect);
+            
+            if (PtInRect(&rect, pt)) {
+                LONG exStyle = GetWindowLongA(hwnd, GWL_EXSTYLE);
+                char className[256];
+                char windowName[256];
+                
+                /* Avoid implicit memset from {0} initialization */
+                className[0] = '\0';
+                windowName[0] = '\0';
+                
+                GetClassNameA(hwnd, className, sizeof(className));
+                GetWindowTextA(hwnd, windowName, sizeof(windowName));
+
+                /* Priority match: Magpie or Lossless Scaling overlays */
+                if (str_contains(className, "Magpie") || str_contains(windowName, "Magpie") ||
+                    str_contains(className, "Lossless") || str_contains(windowName, "Lossless")) {
+                    return hwnd;
+                }
+
+                /* Standard behavior: ignore click-through / disabled windows */
+                if ((exStyle & WS_EX_TRANSPARENT) == 0) {
+                    LONG style = GetWindowLongA(hwnd, GWL_STYLE);
+                    if ((style & WS_DISABLED) == 0) {
+                        return hwnd;
+                    }
+                }
+            }
+        }
+        hwnd = GetWindow(hwnd, GW_HWNDNEXT);
+    }
+    
+    /* Fallback if enumeration fails */
+    return WindowFromPoint(pt);
 }
 
 static void CaptureWindowClientArea(HWND hwnd) {
@@ -68,7 +135,8 @@ static void CaptureWindowClientArea(HWND hwnd) {
     hBitmap = CreateCompatibleBitmap(hScreenDC, width, height);
     hOldBitmap = (HBITMAP)SelectObject(hMemoryDC, hBitmap);
 
-    BitBlt(hMemoryDC, 0, 0, width, height, hScreenDC, topLeft.x, topLeft.y, SRCCOPY);
+    /* CAPTUREBLT is required to copy layered/transparent windows like Magpie overlays */
+    BitBlt(hMemoryDC, 0, 0, width, height, hScreenDC, topLeft.x, topLeft.y, SRCCOPY | CAPTUREBLT);
 
     if (OpenClipboard(NULL)) {
         EmptyClipboard();
@@ -87,7 +155,7 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode >= 0) {
         if (waitingForClick && wParam == WM_LBUTTONDOWN) {
             MSLLHOOKSTRUCT *pMouseStruct = (MSLLHOOKSTRUCT *)lParam;
-            HWND hwnd = WindowFromPoint(pMouseStruct->pt);
+            HWND hwnd = GetTopLevelWindowFromPoint(pMouseStruct->pt);
             
             CaptureWindowClientArea(hwnd);
             log_timed("Captured to clipboard!");
@@ -104,9 +172,7 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
     return CallNextHookEx(hMouseHook, nCode, wParam, lParam);
 }
 
-/* Replaces main() to avoid the CRT startup overhead and __main insertion */
 void __stdcall mainCRTStartup(void) {
-    /* Do not initialize with = {0} to avoid implicit memset generation by GCC */
     MSG msg;
 
     #if defined(_WIN64)

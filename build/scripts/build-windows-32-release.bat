@@ -21,7 +21,7 @@ gcc -nostdlib -fno-builtin %PROJECT_ROOT%\main.c ^
     -Wl,--gc-sections ^
     -Wl,--build-id=none ^
     -m32 ^
--o %BUILD_OUT_PATH%\cuikcap.exe -lgdi32 -luser32 -lkernel32
+-o %BUILD_OUT_PATH%\cuikcap32.exe -lgdi32 -luser32 -lkernel32
 if %ERRORLEVEL% neq 0 (
     echo Build failed.
 ) else (
