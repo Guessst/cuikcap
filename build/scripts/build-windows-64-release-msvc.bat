@@ -11,7 +11,7 @@ if not exist "%BUILD_OUT_PATH%" mkdir "%BUILD_OUT_PATH%"
 
 cl "%PROJECT_ROOT%\main.c" ^
     /nologo ^
-    /std:c99 ^
+    /std:c11 ^
     /W4 ^
     /O1 ^
     /GL ^
@@ -25,7 +25,7 @@ cl "%PROJECT_ROOT%\main.c" ^
     /LTCG ^
     /NODEFAULTLIB ^
     /ENTRY:mainCRTStartup ^
-    /SUBSYSTEM:WINDOWS ^
+    /SUBSYSTEM:CONSOLE ^
     /OPT:REF ^
     /OPT:ICF ^
     /MERGE:.rdata=.text ^

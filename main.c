@@ -6,6 +6,30 @@
 #define CONFIG_GAP_LEN  4    /* Length of gaps in pixels */
 #define CONFIG_ANIM_MS  40   /* Speed of the marching ants (lower = faster) */
 
+#define WM_APP_REBIND (WM_APP + 1)
+
+typedef enum {
+    ACTION_CAPTURE,
+    ACTION_CANCEL,
+    ACTION_REBIND,
+    ACTION_QUIT
+} ActionType;
+
+typedef struct {
+    ActionType action;
+    UINT mod;
+    UINT vk;
+    const char* name;
+} KeyBind;
+
+/* Global action bindings. Index 0 is dynamic, the rest are fixed. */
+static KeyBind binds[4] = {
+    {ACTION_CAPTURE, MOD_CONTROL, VK_SNAPSHOT, "Capture Window"},
+    {ACTION_CANCEL, 0, VK_ESCAPE, "Cancel Selection"},
+    {ACTION_REBIND, MOD_CONTROL, 'O', "Rebind Capture Key"},
+    {ACTION_QUIT, MOD_CONTROL, 'C', "Quit Program"}
+};
+
 static HWND hOverlay = NULL;
 static HBITMAP hFrozenScreen = NULL;
 static HBRUSH hMarchingBrush = NULL;
@@ -20,10 +44,46 @@ static int vScreenTop = 0;
 static int vScreenWidth = 0;
 static int vScreenHeight = 0;
 
-/* Generates a seamless diagonal pattern brush of exact user-configured size */
+static DWORD mainThreadId = 0;
+
+/* --- Helpers --- */
+static void FormatKeyBind(UINT mod, UINT vk, char* outBuf) {
+    int pos = 0;
+    
+    if (mod & MOD_CONTROL) {
+        const char* s = "CTRL+";
+        while (*s) outBuf[pos++] = *s++;
+    }
+    if (mod & MOD_SHIFT) {
+        const char* s = "SHIFT+";
+        while (*s) outBuf[pos++] = *s++;
+    }
+    if (mod & MOD_ALT) {
+        const char* s = "ALT+";
+        while (*s) outBuf[pos++] = *s++;
+    }
+    
+    if ((vk >= '0' && vk <= '9') || (vk >= 'A' && vk <= 'Z')) {
+        outBuf[pos++] = (char)vk;
+    } else if (vk >= VK_F1 && vk <= VK_F24) {
+        pos += wsprintfA(outBuf + pos, "F%d", vk - VK_F1 + 1);
+    } else if (vk == VK_SNAPSHOT) {
+        const char* s = "PRINTSCREEN";
+        while (*s) outBuf[pos++] = *s++;
+    } else if (vk == VK_ESCAPE) {
+        const char* s = "ESC";
+        while (*s) outBuf[pos++] = *s++;
+    } else if (vk == VK_SPACE) {
+        const char* s = "SPACE";
+        while (*s) outBuf[pos++] = *s++;
+    } else {
+        pos += wsprintfA(outBuf + pos, "KEY(0x%02X)", vk);
+    }
+    outBuf[pos] = '\0';
+}
+
 static HBRUSH CreateMarchingBrush(void) {
     int patSize = CONFIG_DASH_LEN + CONFIG_GAP_LEN;
-    /* CreateBitmap requires scanlines to be 16-bit (WORD) aligned */
     int bytesPerRow = ((patSize + 15) / 16) * 2;
     int allocSize = bytesPerRow * patSize;
     BYTE* bits;
@@ -36,7 +96,6 @@ static HBRUSH CreateMarchingBrush(void) {
 
     for (y = 0; y < patSize; y++) {
         for (x = 0; x < patSize; x++) {
-            /* Create a diagonal stripe that wraps perfectly */
             if ((x + y) % patSize < CONFIG_DASH_LEN) {
                 bits[y * bytesPerRow + (x / 8)] |= (0x80 >> (x % 8));
             }
@@ -95,10 +154,175 @@ static void log_timed(const char* message) {
     }
 }
 
+static void SaveConfig(UINT mod, UINT vk) {
+    HANDLE hFile = CreateFileA("cuickcap.config", GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile != INVALID_HANDLE_VALUE && hFile != NULL) {
+        char buf[64];
+        DWORD written;
+        int len = wsprintfA(buf, "%u %u", mod, vk);
+        WriteFile(hFile, buf, (DWORD)len, &written, NULL);
+        CloseHandle(hFile);
+    }
+}
+
+static void LoadConfig(void) {
+    HANDLE hFile = CreateFileA("cuickcap.config", GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile != INVALID_HANDLE_VALUE && hFile != NULL) {
+        char buf[64];
+        DWORD read = 0;
+        int i;
+        
+        for (i = 0; i < 64; i++) {
+            buf[i] = 0;
+        }
+        
+        if (ReadFile(hFile, buf, sizeof(buf) - 1, &read, NULL) && read > 0) {
+            UINT m = 0, v = 0;
+            char* p = buf;
+            while (*p >= '0' && *p <= '9') { m = m * 10 + (*p - '0'); p++; }
+            while (*p == ' ') p++;
+            while (*p >= '0' && *p <= '9') { v = v * 10 + (*p - '0'); p++; }
+            if (v != 0) {
+                binds[0].mod = m;
+                binds[0].vk = v;
+            }
+        }
+        CloseHandle(hFile);
+    } else {
+        SaveConfig(binds[0].mod, binds[0].vk);
+    }
+}
+
+static DWORD WINAPI ConsoleInputThread(LPVOID lpParam) {
+    HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
+    INPUT_RECORD ir;
+    DWORD read;
+    BOOL rebinding = FALSE;
+    DWORD mode;
+
+    if (hStdin == INVALID_HANDLE_VALUE || hStdin == NULL) {
+        return 0;
+    }
+
+    GetConsoleMode(hStdin, &mode);
+    SetConsoleMode(hStdin, mode & ~(ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT));
+
+    while (TRUE) {
+        DWORD events = 0;
+        
+        if (GetNumberOfConsoleInputEvents(hStdin, &events) && events > 0) {
+            if (ReadConsoleInputA(hStdin, &ir, 1, &read) && read > 0) {
+                if (ir.EventType == KEY_EVENT && ir.Event.KeyEvent.bKeyDown) {
+                    WORD vk = ir.Event.KeyEvent.wVirtualKeyCode;
+                    DWORD ctrlState = ir.Event.KeyEvent.dwControlKeyState;
+                    
+                    BOOL isCtrl = (ctrlState & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)) != 0;
+                    BOOL isShift = (ctrlState & SHIFT_PRESSED) != 0;
+                    BOOL isAlt = (ctrlState & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED)) != 0;
+                    
+                    UINT mod = 0;
+                    if (isCtrl) mod |= MOD_CONTROL;
+                    if (isShift) mod |= MOD_SHIFT;
+                    if (isAlt) mod |= MOD_ALT;
+
+                    if (vk != VK_CONTROL && vk != VK_LCONTROL && vk != VK_RCONTROL &&
+                        vk != VK_SHIFT && vk != VK_LSHIFT && vk != VK_RSHIFT &&
+                        vk != VK_MENU && vk != VK_LMENU && vk != VK_RMENU) {
+                        
+                        if (!rebinding) {
+                            if (mod == binds[2].mod && vk == binds[2].vk) { 
+                                rebinding = TRUE;
+                                log_timed("Rebind mode: Press new key combination for capture...");
+                            } else if (mod == binds[3].mod && vk == binds[3].vk) { 
+                                log_timed("Quit requested. Exiting...");
+                                PostThreadMessageA(mainThreadId, WM_QUIT, 0, 0);
+                                return 0;
+                            }
+                        } else {
+                            BOOL collision = FALSE;
+                            int i;
+                            
+                            for (i = 1; i < 4; i++) {
+                                if (binds[i].mod == mod && binds[i].vk == vk) {
+                                    collision = TRUE; break;
+                                }
+                                if (binds[i].action == ACTION_CANCEL && vk == binds[i].vk) {
+                                    collision = TRUE; break;
+                                }
+                            }
+                            
+                            if (collision) {
+                                log_timed("Clash detected! That key is reserved. Choose another.");
+                            } else {
+                                char msgBuf[128];
+                                char keyName[32];
+                                
+                                binds[0].mod = mod;
+                                binds[0].vk = (UINT)vk;
+                                SaveConfig(mod, (UINT)vk);
+                                PostThreadMessageA(mainThreadId, WM_APP_REBIND, 0, 0);
+                                rebinding = FALSE;
+                                
+                                FormatKeyBind(mod, (UINT)vk, keyName);
+                                wsprintfA(msgBuf, "Keybind updated successfully to: %s", keyName);
+                                log_timed(msgBuf);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        /* Fallback poll explicitly for PrintScreen */
+        if (rebinding) {
+            if (GetAsyncKeyState(VK_SNAPSHOT) & 0x8000) {
+                UINT mod = 0;
+                BOOL collision = FALSE;
+                int i;
+                
+                if (GetAsyncKeyState(VK_CONTROL) & 0x8000) mod |= MOD_CONTROL;
+                if (GetAsyncKeyState(VK_SHIFT) & 0x8000) mod |= MOD_SHIFT;
+                if (GetAsyncKeyState(VK_MENU) & 0x8000) mod |= MOD_ALT;
+                
+                for (i = 1; i < 4; i++) {
+                    if (binds[i].mod == mod && binds[i].vk == VK_SNAPSHOT) {
+                        collision = TRUE; break;
+                    }
+                    if (binds[i].action == ACTION_CANCEL && VK_SNAPSHOT == binds[i].vk) {
+                        collision = TRUE; break;
+                    }
+                }
+                
+                if (collision) {
+                    log_timed("Clash detected! That key is reserved. Choose another.");
+                } else {
+                    char msgBuf[128];
+                    char keyName[32];
+                    
+                    binds[0].mod = mod;
+                    binds[0].vk = VK_SNAPSHOT;
+                    SaveConfig(mod, VK_SNAPSHOT);
+                    PostThreadMessageA(mainThreadId, WM_APP_REBIND, 0, 0);
+                    rebinding = FALSE;
+                    
+                    FormatKeyBind(mod, VK_SNAPSHOT, keyName);
+                    wsprintfA(msgBuf, "Keybind updated successfully to: %s", keyName);
+                    log_timed(msgBuf);
+                }
+                
+                while(GetAsyncKeyState(VK_SNAPSHOT) & 0x8000) Sleep(10);
+            }
+        }
+        
+        Sleep(10);
+    }
+    (void)lpParam;
+    return 0;
+}
+
 static HWND GetTopLevelWindowFromPoint(POINT pt) {
     HWND hwnd = GetTopWindow(NULL);
     while (hwnd) {
-        /* Ignore our overlay window to allow finding the window underneath */
         if (hwnd != hOverlay && IsWindowVisible(hwnd)) {
             RECT rect;
             GetWindowRect(hwnd, &rect);
@@ -130,14 +354,11 @@ static HWND GetTopLevelWindowFromPoint(POINT pt) {
         hwnd = GetWindow(hwnd, GW_HWNDNEXT);
     }
     
-    /* Returning NULL instead of WindowFromPoint safely handles desktop background clicks */
     return NULL;
 }
 
 static RECT GetWindowClientScreenRect(HWND hwnd) {
     RECT rect;
-    
-    /* Avoid implicit memset generation */
     rect.left = 0;
     rect.top = 0;
     rect.right = 0;
@@ -215,10 +436,6 @@ static void EndCaptureSession(void) {
     currentSelection.bottom = 0;
 }
 
-/* 
- * The overlay now naturally handles mouse and keyboard messages,
- * entirely bypassing the need for global low-level hooks.
- */
 static LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_TIMER:
@@ -231,7 +448,6 @@ static LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                 if (currentSelection.right > currentSelection.left) {
                     RECT r;
                     r = currentSelection;
-                    /* Inflate enough to encompass the 1px external border */
                     InflateRect(&r, 2, 2);
                     OffsetRect(&r, -vScreenLeft, -vScreenTop);
                     InvalidateRect(hwnd, &r, FALSE);
@@ -323,7 +539,6 @@ static LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         
         case WM_LBUTTONDOWN:
             isClicking = TRUE;
-            /* Captures all mouse input to this window so we reliably receive WM_LBUTTONUP */
             SetCapture(hwnd);
             return 0;
             
@@ -352,7 +567,7 @@ static LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             return 0;
             
         case WM_KEYDOWN:
-            if (wParam == VK_ESCAPE) {
+            if (wParam == binds[1].vk) { 
                 EndCaptureSession();
                 log_timed("Capture canceled (Escape).");
             }
@@ -369,6 +584,8 @@ void __stdcall mainCRTStartup(void) {
     HGDIOBJ hOld;
     POINT pt;
     HWND hwnd_init;
+    char msgBuf[128];
+    char keyNameBuf[32];
 
     #if defined(_WIN64)
     log_timed("(Windows 64-bit)");
@@ -377,6 +594,8 @@ void __stdcall mainCRTStartup(void) {
     log_timed("(Windows 32-bit)");
     #endif
 
+    mainThreadId = GetCurrentThreadId();
+    LoadConfig();
     hMarchingBrush = CreateMarchingBrush();
 
     wc.style = 0;
@@ -391,16 +610,34 @@ void __stdcall mainCRTStartup(void) {
     wc.hCursor = LoadCursor(NULL, IDC_CROSS);
     RegisterClassA(&wc);
 
-    if (!RegisterHotKey(NULL, 1, MOD_CONTROL, VK_SNAPSHOT)) {
-        log_timed("Failed to register hotkey. It might be in use.");
+    if (!RegisterHotKey(NULL, 1, binds[0].mod, binds[0].vk)) {
+        log_timed("Failed to register initial hotkey. It might be in use.");
         ExitProcess(1);
     }
+    
+    CreateThread(NULL, 0, ConsoleInputThread, NULL, 0, NULL);
 
-    /* Note: Global hooks completely removed */
-    log_timed("Running. Press Ctrl + PrintScreen, then click a window.");
+    /* Dynamic startup messages */
+    FormatKeyBind(binds[0].mod, binds[0].vk, keyNameBuf);
+    wsprintfA(msgBuf, "Running. Press %s, then click a window.", keyNameBuf);
+    log_timed(msgBuf);
+
+    FormatKeyBind(binds[2].mod, binds[2].vk, keyNameBuf);
+    wsprintfA(msgBuf, "Press %s in this console to change the capture hotkey.", keyNameBuf);
+    log_timed(msgBuf);
+
+    FormatKeyBind(binds[3].mod, binds[3].vk, keyNameBuf);
+    wsprintfA(msgBuf, "Press %s in this console to exit.", keyNameBuf);
+    log_timed(msgBuf);
 
     while (GetMessage(&msg, NULL, 0, 0)) {
-        if (msg.message == WM_HOTKEY && msg.wParam == 1 && !waitingForClick) {
+        if (msg.message == WM_APP_REBIND) {
+            UnregisterHotKey(NULL, 1);
+            if (!RegisterHotKey(NULL, 1, binds[0].mod, binds[0].vk)) {
+                log_timed("OS rejected the new hotkey. It may be globally reserved.");
+            }
+        }
+        else if (msg.message == WM_HOTKEY && msg.wParam == 1 && !waitingForClick) {
             waitingForClick = TRUE;
             animOffset = 0;
             
@@ -425,7 +662,6 @@ void __stdcall mainCRTStartup(void) {
             currentSelection.right = 0;
             currentSelection.bottom = 0;
 
-            /* WS_EX_TRANSPARENT and WS_EX_LAYERED removed to allow overlay to receive native input */
             hOverlay = CreateWindowExA(
                 WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
                 "CuikCapOverlay", "",
@@ -434,7 +670,6 @@ void __stdcall mainCRTStartup(void) {
                 NULL, NULL, GetModuleHandle(NULL), NULL
             );
             
-            /* Show normally, bring to foreground, and focus to ensure keyboard intercepts work */
             ShowWindow(hOverlay, SW_SHOW);
             SetForegroundWindow(hOverlay);
             SetFocus(hOverlay);
