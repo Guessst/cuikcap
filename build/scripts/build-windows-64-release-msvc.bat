@@ -14,7 +14,6 @@ cl "%PROJECT_ROOT%\main.c" ^
     /std:c11 ^
     /W4 ^
     /O1 ^
-    /GL ^
     /Gy ^
     /Gw ^
     /GS- ^
