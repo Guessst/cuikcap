@@ -22,7 +22,7 @@ typedef struct {
     const char* name;
 } KeyBind;
 
-/* --- BSS Segment Globals (Auto-zeroed by OS Loader) --- */
+/* Global action bindings. Index 0 is dynamic, the rest are fixed. */
 static KeyBind binds[4] = {
     {ACTION_CAPTURE, MOD_CONTROL, VK_SNAPSHOT, "Capture Window"},
     {ACTION_CANCEL, 0, VK_ESCAPE, "Cancel Selection"},
@@ -30,52 +30,21 @@ static KeyBind binds[4] = {
     {ACTION_QUIT, MOD_CONTROL, 'C', "Quit Program"}
 };
 
-static HWND hOverlay;
-static HBITMAP hFrozenScreen;
-static HBRUSH hMarchingBrush;
+static HWND hOverlay = NULL;
+static HBITMAP hFrozenScreen = NULL;
+static HBRUSH hMarchingBrush = NULL;
 
-static BOOL waitingForClick;
-static BOOL isClicking;
-static int animOffset;
+static BOOL waitingForClick = FALSE;
+static BOOL isClicking = FALSE;
+static int animOffset = 0;
 
 static RECT currentSelection;
-static int vScreenLeft;
-static int vScreenTop;
-static int vScreenWidth;
-static int vScreenHeight;
+static int vScreenLeft = 0;
+static int vScreenTop = 0;
+static int vScreenWidth = 0;
+static int vScreenHeight = 0;
 
-static DWORD mainThreadId;
-
-/* Persistent GDI Handles */
-static HDC hScreenDC;
-static HDC hMemDC;
-
-/* Static Buffers & Structs */
-static char logBufMain[256];
-static char logBufConsole[256];
-static BYTE brushBits[256];
-static char classNameBuf[256];
-static char windowNameBuf[256];
-static char msgBuf[128];
-static char keyNameBuf[32];
-static WNDCLASSA wc;
-static MSG msg;
-static POINT pt;
-static INPUT_RECORD ir;
-static PAINTSTRUCT ps;
-static RECT oldArea;
-static RECT newArea;
-
-#if defined(_MSC_VER)
-void* memset(void* dest, int c, size_t count)
-{
-    unsigned char* p = (unsigned char*)dest;
-    while (count--) {
-        *p++ = (unsigned char)c;
-    }
-    return dest;
-}
-#endif
+static DWORD mainThreadId = 0;
 
 /* --- Helpers --- */
 static void FormatKeyBind(UINT mod, UINT vk, char* outBuf) {
@@ -116,29 +85,30 @@ static void FormatKeyBind(UINT mod, UINT vk, char* outBuf) {
 static HBRUSH CreateMarchingBrush(void) {
     int patSize = CONFIG_DASH_LEN + CONFIG_GAP_LEN;
     int bytesPerRow = ((patSize + 15) / 16) * 2;
+    int allocSize = bytesPerRow * patSize;
+    BYTE* bits;
     HBITMAP hBmp;
     HBRUSH hBrush = NULL;
     int x, y;
 
-    /* Manual zeroing avoids implicit memset */
-    for (x = 0; x < 256; x++) {
-        brushBits[x] = 0;
-    }
+    bits = (BYTE*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, allocSize);
+    if (!bits) return NULL;
 
-    for (y = 0; y < patSize && y < 256 / bytesPerRow; y++) {
+    for (y = 0; y < patSize; y++) {
         for (x = 0; x < patSize; x++) {
             if ((x + y) % patSize < CONFIG_DASH_LEN) {
-                brushBits[y * bytesPerRow + (x / 8)] |= (0x80 >> (x % 8));
+                bits[y * bytesPerRow + (x / 8)] |= (0x80 >> (x % 8));
             }
         }
     }
     
-    hBmp = CreateBitmap(patSize, patSize, 1, 1, brushBits);
+    hBmp = CreateBitmap(patSize, patSize, 1, 1, bits);
     if (hBmp) {
         hBrush = CreatePatternBrush(hBmp);
         DeleteObject(hBmp);
     }
     
+    HeapFree(GetProcessHeap(), 0, bits);
     return hBrush;
 }
 
@@ -166,7 +136,7 @@ static int str_contains(const char* haystack, const char* needle) {
 
 static void log_timed(const char* message) {
     SYSTEMTIME st;
-    char* buffer = (GetCurrentThreadId() == mainThreadId) ? logBufMain : logBufConsole;
+    char buffer[256];
     HANDLE hConsole;
     DWORD written;
     int len;
@@ -225,6 +195,7 @@ static void LoadConfig(void) {
 
 static DWORD WINAPI ConsoleInputThread(LPVOID lpParam) {
     HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
+    INPUT_RECORD ir;
     DWORD read;
     BOOL rebinding = FALSE;
     DWORD mode;
@@ -283,14 +254,17 @@ static DWORD WINAPI ConsoleInputThread(LPVOID lpParam) {
                             if (collision) {
                                 log_timed("Clash detected! That key is reserved. Choose another.");
                             } else {
+                                char msgBuf[128];
+                                char keyName[32];
+                                
                                 binds[0].mod = mod;
                                 binds[0].vk = (UINT)vk;
                                 SaveConfig(mod, (UINT)vk);
                                 PostThreadMessageA(mainThreadId, WM_APP_REBIND, 0, 0);
                                 rebinding = FALSE;
                                 
-                                FormatKeyBind(mod, (UINT)vk, keyNameBuf);
-                                wsprintfA(msgBuf, "Keybind updated successfully to: %s", keyNameBuf);
+                                FormatKeyBind(mod, (UINT)vk, keyName);
+                                wsprintfA(msgBuf, "Keybind updated successfully to: %s", keyName);
                                 log_timed(msgBuf);
                             }
                         }
@@ -299,6 +273,7 @@ static DWORD WINAPI ConsoleInputThread(LPVOID lpParam) {
             }
         }
 
+        /* Fallback poll explicitly for PrintScreen */
         if (rebinding) {
             if (GetAsyncKeyState(VK_SNAPSHOT) & 0x8000) {
                 UINT mod = 0;
@@ -321,14 +296,17 @@ static DWORD WINAPI ConsoleInputThread(LPVOID lpParam) {
                 if (collision) {
                     log_timed("Clash detected! That key is reserved. Choose another.");
                 } else {
+                    char msgBuf[128];
+                    char keyName[32];
+                    
                     binds[0].mod = mod;
                     binds[0].vk = VK_SNAPSHOT;
                     SaveConfig(mod, VK_SNAPSHOT);
                     PostThreadMessageA(mainThreadId, WM_APP_REBIND, 0, 0);
                     rebinding = FALSE;
                     
-                    FormatKeyBind(mod, VK_SNAPSHOT, keyNameBuf);
-                    wsprintfA(msgBuf, "Keybind updated successfully to: %s", keyNameBuf);
+                    FormatKeyBind(mod, VK_SNAPSHOT, keyName);
+                    wsprintfA(msgBuf, "Keybind updated successfully to: %s", keyName);
                     log_timed(msgBuf);
                 }
                 
@@ -342,24 +320,26 @@ static DWORD WINAPI ConsoleInputThread(LPVOID lpParam) {
     return 0;
 }
 
-static HWND GetTopLevelWindowFromPoint(POINT p) {
+static HWND GetTopLevelWindowFromPoint(POINT pt) {
     HWND hwnd = GetTopWindow(NULL);
     while (hwnd) {
         if (hwnd != hOverlay && IsWindowVisible(hwnd)) {
             RECT rect;
             GetWindowRect(hwnd, &rect);
             
-            if (p.x >= rect.left && p.x < rect.right && p.y >= rect.top && p.y < rect.bottom) {
+            if (PtInRect(&rect, pt)) {
                 LONG exStyle = GetWindowLongA(hwnd, GWL_EXSTYLE);
+                char className[256];
+                char windowName[256];
                 
-                classNameBuf[0] = '\0';
-                windowNameBuf[0] = '\0';
+                className[0] = '\0';
+                windowName[0] = '\0';
                 
-                GetClassNameA(hwnd, classNameBuf, sizeof(classNameBuf));
-                GetWindowTextA(hwnd, windowNameBuf, sizeof(windowNameBuf));
+                GetClassNameA(hwnd, className, sizeof(className));
+                GetWindowTextA(hwnd, windowName, sizeof(windowName));
 
-                if (str_contains(classNameBuf, "Magpie") || str_contains(windowNameBuf, "Magpie") ||
-                    str_contains(classNameBuf, "Lossless") || str_contains(windowNameBuf, "Lossless")) {
+                if (str_contains(className, "Magpie") || str_contains(windowName, "Magpie") ||
+                    str_contains(className, "Lossless") || str_contains(windowName, "Lossless")) {
                     return hwnd;
                 }
 
@@ -378,30 +358,49 @@ static HWND GetTopLevelWindowFromPoint(POINT p) {
 }
 
 static RECT GetWindowClientScreenRect(HWND hwnd) {
-    static RECT rect;
-    rect.left = rect.top = rect.right = rect.bottom = 0;
+    RECT rect;
+    rect.left = 0;
+    rect.top = 0;
+    rect.right = 0;
+    rect.bottom = 0;
     
     if (hwnd) {
         HWND rootHwnd = GetAncestor(hwnd, GA_ROOT);
+        POINT tl;
+        POINT br;
+        
         if (!rootHwnd) rootHwnd = hwnd;
         GetClientRect(rootHwnd, &rect);
-        MapWindowPoints(rootHwnd, NULL, (LPPOINT)&rect, 2);
+        
+        tl.x = rect.left;
+        tl.y = rect.top;
+        br.x = rect.right;
+        br.y = rect.bottom;
+        
+        ClientToScreen(rootHwnd, &tl);
+        ClientToScreen(rootHwnd, &br);
+        
+        rect.left = tl.x;
+        rect.top = tl.y;
+        rect.right = br.x;
+        rect.bottom = br.y;
     }
     return rect;
 }
 
 static void CaptureFromFrozenScreen(int x, int y, int width, int height) {
+    HDC hScreenDC = GetDC(NULL);
+    HDC hSrcDC = CreateCompatibleDC(hScreenDC);
     HDC hDestDC = CreateCompatibleDC(hScreenDC);
     HBITMAP hBitmap;
     HGDIOBJ hOldDest;
-    HGDIOBJ hOldSrc;
 
-    hOldSrc = SelectObject(hMemDC, hFrozenScreen);
+    SelectObject(hSrcDC, hFrozenScreen);
 
     hBitmap = CreateCompatibleBitmap(hScreenDC, width, height);
     hOldDest = SelectObject(hDestDC, hBitmap);
 
-    BitBlt(hDestDC, 0, 0, width, height, hMemDC, x - vScreenLeft, y - vScreenTop, SRCCOPY);
+    BitBlt(hDestDC, 0, 0, width, height, hSrcDC, x - vScreenLeft, y - vScreenTop, SRCCOPY);
 
     if (OpenClipboard(NULL)) {
         EmptyClipboard();
@@ -412,8 +411,9 @@ static void CaptureFromFrozenScreen(int x, int y, int width, int height) {
     }
 
     SelectObject(hDestDC, hOldDest);
-    SelectObject(hMemDC, hOldSrc);
     DeleteDC(hDestDC);
+    DeleteDC(hSrcDC);
+    ReleaseDC(NULL, hScreenDC);
 }
 
 static void EndCaptureSession(void) {
@@ -436,8 +436,8 @@ static void EndCaptureSession(void) {
     currentSelection.bottom = 0;
 }
 
-static LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
-    switch (uMsg) {
+static LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
         case WM_TIMER:
             if (wParam == 1) {
                 animOffset++;
@@ -446,25 +446,27 @@ static LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
                 }
                 
                 if (currentSelection.right > currentSelection.left) {
-                    oldArea = currentSelection;
-                    oldArea.left   = oldArea.left - vScreenLeft - 2;
-                    oldArea.top    = oldArea.top - vScreenTop - 2;
-                    oldArea.right  = oldArea.right - vScreenLeft + 2;
-                    oldArea.bottom = oldArea.bottom - vScreenTop + 2;
-                    InvalidateRect(hwnd, &oldArea, FALSE);
+                    RECT r;
+                    r = currentSelection;
+                    InflateRect(&r, 2, 2);
+                    OffsetRect(&r, -vScreenLeft, -vScreenTop);
+                    InvalidateRect(hwnd, &r, FALSE);
                 }
             }
             return 0;
 
         case WM_PAINT: {
+            PAINTSTRUCT ps;
             HDC hdc = BeginPaint(hwnd, &ps);
 
             if (hFrozenScreen) {
+                HDC hMemDC = CreateCompatibleDC(hdc);
                 HGDIOBJ hOld = SelectObject(hMemDC, hFrozenScreen);
                 BitBlt(hdc, ps.rcPaint.left, ps.rcPaint.top, 
                        ps.rcPaint.right - ps.rcPaint.left, ps.rcPaint.bottom - ps.rcPaint.top,
                        hMemDC, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
                 SelectObject(hMemDC, hOld);
+                DeleteDC(hMemDC);
             }
 
             if (currentSelection.right > currentSelection.left && hMarchingBrush) {
@@ -502,30 +504,31 @@ static LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
             return 1;
             
         case WM_MOUSEMOVE: {
+            POINT pt;
             HWND target;
+            RECT newSelection;
+            
             GetCursorPos(&pt);
             target = GetTopLevelWindowFromPoint(pt);
-            newArea = GetWindowClientScreenRect(target);
+            newSelection = GetWindowClientScreenRect(target);
             
-            if (newArea.left != currentSelection.left || 
-                newArea.top != currentSelection.top || 
-                newArea.right != currentSelection.right || 
-                newArea.bottom != currentSelection.bottom) {
+            if (newSelection.left != currentSelection.left || 
+                newSelection.top != currentSelection.top || 
+                newSelection.right != currentSelection.right || 
+                newSelection.bottom != currentSelection.bottom) {
                 
-                oldArea = currentSelection;
-                currentSelection = newArea;
+                RECT oldArea = currentSelection;
+                RECT newArea;
+                currentSelection = newSelection;
                 
                 if (hOverlay) {
-                    oldArea.left   = oldArea.left - vScreenLeft - 4;
-                    oldArea.top    = oldArea.top - vScreenTop - 4;
-                    oldArea.right  = oldArea.right - vScreenLeft + 4;
-                    oldArea.bottom = oldArea.bottom - vScreenTop + 4;
+                    InflateRect(&oldArea, 4, 4);
+                    OffsetRect(&oldArea, -vScreenLeft, -vScreenTop);
                     InvalidateRect(hOverlay, &oldArea, FALSE);
 
-                    newArea.left   = newArea.left - vScreenLeft - 4;
-                    newArea.top    = newArea.top - vScreenTop - 4;
-                    newArea.right  = newArea.right - vScreenLeft + 4;
-                    newArea.bottom = newArea.bottom - vScreenTop + 4;
+                    newArea = currentSelection;
+                    InflateRect(&newArea, 4, 4);
+                    OffsetRect(&newArea, -vScreenLeft, -vScreenTop);
                     InvalidateRect(hOverlay, &newArea, FALSE);
                     
                     UpdateWindow(hOverlay);
@@ -570,12 +573,19 @@ static LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
             }
             return 0;
     }
-    return DefWindowProcA(hwnd, uMsg, wParam, lParam);
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
 }
 
 void __stdcall mainCRTStartup(void) {
+    MSG msg;
+    WNDCLASSA wc;
+    HDC hScreenDC;
+    HDC hMemDC;
     HGDIOBJ hOld;
+    POINT pt;
     HWND hwnd_init;
+    char msgBuf[128];
+    char keyNameBuf[32];
 
     #if defined(_WIN64)
     log_timed("(Windows 64-bit)");
@@ -585,15 +595,15 @@ void __stdcall mainCRTStartup(void) {
     #endif
 
     mainThreadId = GetCurrentThreadId();
-    
-    /* Initialize global persistent DCs */
-    hScreenDC = GetDC(NULL);
-    hMemDC = CreateCompatibleDC(hScreenDC);
-
     LoadConfig();
     hMarchingBrush = CreateMarchingBrush();
 
-    /* BSS ensures style, cbClsExtra, etc are 0 natively */
+    wc.style = 0;
+    wc.cbClsExtra = 0;
+    wc.cbWndExtra = 0;
+    wc.hIcon = NULL;
+    wc.hbrBackground = NULL;
+    wc.lpszMenuName = NULL;
     wc.lpfnWndProc = OverlayWndProc;
     wc.hInstance = GetModuleHandle(NULL);
     wc.lpszClassName = "CuikCapOverlay";
@@ -607,6 +617,7 @@ void __stdcall mainCRTStartup(void) {
     
     CreateThread(NULL, 0, ConsoleInputThread, NULL, 0, NULL);
 
+    /* Dynamic startup messages */
     FormatKeyBind(binds[0].mod, binds[0].vk, keyNameBuf);
     wsprintfA(msgBuf, "Running. Press %s, then click a window.", keyNameBuf);
     log_timed(msgBuf);
@@ -635,11 +646,16 @@ void __stdcall mainCRTStartup(void) {
             vScreenWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
             vScreenHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
             
+            hScreenDC = GetDC(NULL);
+            hMemDC = CreateCompatibleDC(hScreenDC);
             hFrozenScreen = CreateCompatibleBitmap(hScreenDC, vScreenWidth, vScreenHeight);
             
             hOld = SelectObject(hMemDC, hFrozenScreen);
             BitBlt(hMemDC, 0, 0, vScreenWidth, vScreenHeight, hScreenDC, vScreenLeft, vScreenTop, SRCCOPY | CAPTUREBLT);
             SelectObject(hMemDC, hOld);
+            
+            DeleteDC(hMemDC);
+            ReleaseDC(NULL, hScreenDC);
 
             currentSelection.left = 0;
             currentSelection.top = 0;
